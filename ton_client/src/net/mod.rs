@@ -20,9 +20,10 @@ use tokio::sync::mpsc::{channel, Sender};
 mod errors;
 pub use errors::{Error, ErrorCode};
 
-mod node_client;
-pub(crate) use node_client::{NodeClient, MAX_TIMEOUT};
-pub use node_client::{OrderBy, SortDirection};
+mod websocket_link;
+mod server_link;
+pub(crate) use server_link::{ServerLink, MAX_TIMEOUT};
+pub use server_link::{OrderBy, SortDirection};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 
@@ -231,7 +232,7 @@ pub async fn query(
     context: std::sync::Arc<ClientContext>,
     params: ParamsOfQuery,
 ) -> ClientResult<ResultOfQuery> {
-    let client = context.get_client()?;
+    let client = context.get_server_link()?;
     let result = client
         .query(
             &params.query,
@@ -259,7 +260,7 @@ pub async fn query_collection(
     context: std::sync::Arc<ClientContext>,
     params: ParamsOfQueryCollection,
 ) -> ClientResult<ResultOfQueryCollection> {
-    let client = context.get_client()?;
+    let client = context.get_server_link()?;
     let result = client
         .query_collection(
             &params.collection,
@@ -293,7 +294,7 @@ pub async fn wait_for_collection(
     context: std::sync::Arc<ClientContext>,
     params: ParamsOfWaitForCollection,
 ) -> ClientResult<ResultOfWaitForCollection> {
-    let client = context.get_client()?;
+    let client = context.get_server_link()?;
     let result = client
         .wait_for(
             &params.collection,
@@ -309,8 +310,8 @@ pub async fn wait_for_collection(
 
 async fn create_subscription(
     context: std::sync::Arc<ClientContext>, params: &ParamsOfSubscribeCollection
-) -> ClientResult<node_client::Subscription> {
-    let client = context.get_client()?;
+) -> ClientResult<server_link::Subscription> {
+    let client = context.get_server_link()?;
     client
         .subscribe(
             &params.collection,
@@ -331,7 +332,6 @@ pub async fn subscribe_collection<F: Future<Output = ()> + Send>(
     let mut subscription = Some(create_subscription(context.clone(), &params).await?);
 
     let (sender, mut receiver) = channel(1);
-
     add_subscription_handle(&context, handle, sender).await;
 
     // spawn thread which reads subscription stream and calls callback with data
@@ -386,7 +386,7 @@ pub async fn subscribe_collection<F: Future<Output = ()> + Send>(
                 }
             }
         }
-        
+
     }));
 
     Ok(ResultOfSubscribeCollection { handle })
@@ -412,7 +412,7 @@ pub async fn unsubscribe(
 pub async fn suspend(
     context: std::sync::Arc<ClientContext>,
 ) -> ClientResult<()> {
-    context.get_client()?.suspend();
+    context.get_server_link()?.suspend();
 
     let mut subscriptions = context.net.subscriptions.lock().await;
 
@@ -428,7 +428,7 @@ pub async fn suspend(
 pub async fn resume(
     context: std::sync::Arc<ClientContext>,
 ) -> ClientResult<()> {
-    context.get_client()?.resume();
+    context.get_server_link()?.resume();
 
     let mut subscriptions = context.net.subscriptions.lock().await;
 

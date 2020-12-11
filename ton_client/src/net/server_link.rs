@@ -13,6 +13,7 @@
 
 use crate::client::{ClientEnv, FetchMethod};
 use crate::error::{ClientError, ClientResult};
+use crate::net::websocket_link::{GqlOperationEvent, GqlQueryOperation, WebsocketLink};
 use crate::net::{Error, NetworkConfig};
 use futures::{Future, SinkExt, Stream, StreamExt};
 use rand::RngCore;
@@ -20,8 +21,8 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::iter::FromIterator;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 pub const MAX_TIMEOUT: u32 = std::i32::MAX as u32;
 
@@ -63,11 +64,6 @@ impl ServerVersion {
     }
 }
 
-struct VariableRequest {
-    pub query: String,
-    pub variables: Value,
-}
-
 struct ServerInfo {
     pub query_url: String,
     pub subscription_url: String,
@@ -75,27 +71,29 @@ struct ServerInfo {
 }
 
 pub(crate) struct Subscription {
-    pub unsubscribe: Pin<Box<dyn Future<Output=()> + Send>>,
-    pub data_stream: Pin<Box<dyn Stream<Item=ClientResult<Value>> + Send>>,
+    pub unsubscribe: Pin<Box<dyn Future<Output = ()> + Send>>,
+    pub data_stream: Pin<Box<dyn Stream<Item = ClientResult<Value>> + Send>>,
 }
 
-pub(crate) struct NodeClient {
+pub(crate) struct ServerLink {
     config: NetworkConfig,
     client_env: Arc<ClientEnv>,
     suspended: AtomicBool,
     server_info: tokio::sync::RwLock<Option<ServerInfo>>,
     // TODO: use tokio::sync:RwLock when SDK core is fully async
     query_url: std::sync::RwLock<Option<String>>,
+    websocket_link: WebsocketLink,
 }
 
-impl NodeClient {
+impl ServerLink {
     pub fn new(config: NetworkConfig, client_env: Arc<ClientEnv>) -> Self {
-        NodeClient {
-            config,
-            client_env,
+        ServerLink {
+            config: config.clone(),
+            client_env: client_env.clone(),
             suspended: AtomicBool::new(false),
             query_url: std::sync::RwLock::new(None),
             server_info: tokio::sync::RwLock::new(None),
+            websocket_link: WebsocketLink::new(config, client_env.clone()),
         }
     }
 
@@ -198,11 +196,11 @@ impl NodeClient {
         Ok(server_info)
     }
 
-    async fn ensure_client(&self) -> ClientResult<()> {
+    async fn ensure_info(&self) -> ClientResult<()> {
         if self.suspended.load(Ordering::Relaxed) {
             return Err(Error::network_module_suspended());
         }
-        
+
         if self.server_info.read().await.is_some() {
             return Ok(());
         }
@@ -239,9 +237,40 @@ impl NodeClient {
         fields: &str,
     ) -> ClientResult<Subscription> {
         let request = Self::generate_subscription(table, filter, fields);
+        let mut link = self.websocket_link.clone();
+        let receiver = link.start_operation(request).await?;
+        let mut operation_id = 0u32;
+        let unsubscribe = async move {
+            let mut link = link;
+            link.stop_operation(operation_id).await;
+        };
+        let data_receiver = receiver.filter_map(move |e| async move {
+            match e {
+                GqlOperationEvent::Id(id) => {
+                    operation_id = id;
+                    None
+                }
+                GqlOperationEvent::Data(value) => Some(Ok(value)),
+                GqlOperationEvent::Error(error) => Some(Err(error)),
+                GqlOperationEvent::Complete => Some(Ok(Value::Null)),
+            }
+        });
+        Ok(Subscription {
+            data_stream: Box::pin(data_receiver),
+            unsubscribe: Box::pin(unsubscribe),
+        })
+    }
 
+    // Returns Stream with updates database fields by provided filter
+    pub async fn _subscribe(
+        &self,
+        table: &str,
+        filter: &Value,
+        fields: &str,
+    ) -> ClientResult<Subscription> {
+        let request = Self::generate_subscription(table, filter, fields);
         let mut websocket = {
-            self.ensure_client().await?;
+            self.ensure_info().await?;
             let client_lock = self.server_info.read().await;
             let address = &client_lock.as_ref().unwrap().subscription_url;
 
@@ -314,10 +343,11 @@ impl NodeClient {
                 "variables": request.variables,
             }
         })
-            .to_string();
+        .to_string();
         websocket.sender.send(request).await?;
 
         let mut sender = websocket.sender;
+
         let unsubscribe = async move {
             let _ = sender
                 .send(
@@ -326,7 +356,7 @@ impl NodeClient {
                         "type": "stop",
                         "payload": {}
                     })
-                        .to_string(),
+                    .to_string(),
                 )
                 .await;
         };
@@ -364,14 +394,14 @@ impl NodeClient {
     async fn query_vars(
         &self,
         address: &str,
-        request: VariableRequest,
+        request: GqlQueryOperation,
         timeout: Option<u32>,
     ) -> ClientResult<Value> {
         let request = json!({
             "query": request.query,
             "variables": request.variables,
         })
-            .to_string();
+        .to_string();
 
         let mut headers = HashMap::new();
         headers.insert("content-type".to_owned(), "application/json".to_owned());
@@ -408,7 +438,7 @@ impl NodeClient {
     ) -> ClientResult<Value> {
         let query = Self::generate_query_var(table, filter, fields, order_by, limit, timeout);
 
-        self.ensure_client().await?;
+        self.ensure_info().await?;
         let client_lock = self.server_info.read().await;
         let address = &client_lock.as_ref().unwrap().query_url;
 
@@ -433,11 +463,11 @@ impl NodeClient {
         variables: Option<Value>,
         timeout: Option<u32>,
     ) -> ClientResult<Value> {
-        let query = VariableRequest {
+        let query = GqlQueryOperation {
             query: query.into(),
             variables: variables.unwrap_or(json!({})),
         };
-        self.ensure_client().await?;
+        self.ensure_info().await?;
         let client_lock = self.server_info.read().await;
         let address = &client_lock.as_ref().unwrap().query_url;
         Ok(self.query_vars(address, query, timeout).await?)
@@ -476,7 +506,7 @@ impl NodeClient {
         order_by: Option<Vec<OrderBy>>,
         limit: Option<u32>,
         timeout: Option<u32>,
-    ) -> VariableRequest {
+    ) -> GqlQueryOperation {
         let mut scheme_type: Vec<String> = table
             .split_terminator("_")
             .map(|word| {
@@ -508,10 +538,10 @@ impl NodeClient {
             "timeout": timeout
         });
 
-        VariableRequest { query, variables }
+        GqlQueryOperation { query, variables }
     }
 
-    fn generate_subscription(table: &str, filter: &Value, fields: &str) -> VariableRequest {
+    fn generate_subscription(table: &str, filter: &Value, fields: &str) -> GqlQueryOperation {
         let mut scheme_type = (&table[0..table.len() - 1]).to_owned() + "Filter";
         scheme_type[..1].make_ascii_uppercase();
 
@@ -525,15 +555,15 @@ impl NodeClient {
             "filter" : filter,
         });
 
-        VariableRequest { query, variables }
+        GqlQueryOperation { query, variables }
     }
 
-    fn generate_post_mutation(requests: &[MutationRequest]) -> VariableRequest {
+    fn generate_post_mutation(requests: &[MutationRequest]) -> GqlQueryOperation {
         let query = "mutation postRequests($requests:[Request]){postRequests(requests:$requests)}"
             .to_owned();
         let variables = json!({ "requests": serde_json::json!(requests) });
 
-        VariableRequest { query, variables }
+        GqlQueryOperation { query, variables }
     }
 
     // Sends message to node
@@ -543,7 +573,7 @@ impl NodeClient {
             body: base64::encode(value),
         };
 
-        self.ensure_client().await?;
+        self.ensure_info().await?;
         let client_lock = self.server_info.read().await;
         let address = &client_lock.as_ref().unwrap().query_url;
 

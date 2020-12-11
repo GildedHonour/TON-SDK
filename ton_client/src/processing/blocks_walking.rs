@@ -36,7 +36,7 @@ pub async fn find_last_shard_block(
     address: &MsgAddressInt,
 ) -> ClientResult<ton_sdk::BlockId> {
     let workchain = address.get_workchain_id();
-    let client = context.get_client()?;
+    let client = context.get_server_link()?;
 
     // if account resides in masterchain, then starting point is last masterchain block
     // generated before message was sent
@@ -155,7 +155,7 @@ pub async fn wait_next_block(
     address: &MsgAddressInt,
     timeout: Option<u32>,
 ) -> ClientResult<ton_sdk::Block> {
-    let client = context.get_client()?;
+    let client = context.get_server_link()?;
 
     let block = client
         .wait_for(
